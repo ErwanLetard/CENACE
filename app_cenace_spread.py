@@ -16,7 +16,7 @@ except ModuleNotFoundError as e:
     st.error(
         f"Module manquant: {e}. Installe d’abord dans ton venv:\n\n"
         "```bash\n"
-        "python -m pip install streamlit folium streamlit-folium geopy openpyxl branca pandas numpy\n"
+        "python -m pip install streamlit folium streamlit-folium geopy openpyxl branca pandas numpy pyarrow\n"
         "```\n"
     )
     st.stop()
@@ -37,7 +37,7 @@ st.caption(
 )
 
 # =========================================================
-# Helpers
+# Helpers généraux
 # =========================================================
 def extract_voltage_from_node(nodo: str):
     """Extrait le suffixe tension après le dernier '-' ex: '01AAN-85' -> '85' (string, garde '34.5')."""
@@ -64,86 +64,174 @@ def _fmt(val):
     s = str(val).strip()
     return "—" if s == "" or s.lower() == "nan" else s
 
-# ---------- Helpers pour graphe inline dans le popup ----------
-def build_price_series(df_all: pd.DataFrame, nodo: str, start_date, end_date) -> pd.DataFrame:
+# =========================================================
+# Helpers pour courbes (popups)
+# =========================================================
+# ---------- Downsampling LTTB (Largest-Triangle-Three-Buckets) ----------
+def lttb_downsample(x, y, threshold: int):
     """
-    Retourne la série journalière du prix moyen (PML) pour 'nodo' entre start_date et end_date.
-    Colonnes: ['fecha','pml_mean'] triées par fecha.
+    LTTB sur des arrays 1D. x et y seront convertis en np.ndarray plats.
+    Retourne (x_ds, y_ds) en np.ndarray.
+    """
+    x = np.asarray(x).reshape(-1)
+    y = np.asarray(y).reshape(-1)
+    n = len(x)
+    if n != len(y) or n == 0:
+        return x, y
+    if threshold >= n or threshold <= 3:
+        return x, y
+
+    every = (n - 2) / (threshold - 2)
+    a = 0
+    x_res = [x[0]]
+    y_res = [y[0]]
+
+    for i in range(0, threshold - 2):
+        avg_range_start = int(np.floor((i + 1) * every) + 1)
+        avg_range_end   = int(np.floor((i + 2) * every) + 1)
+        if avg_range_end >= n:
+            avg_range_end = n
+
+        if avg_range_end > avg_range_start:
+            avg_x = np.mean(x[avg_range_start:avg_range_end])
+            avg_y = np.mean(y[avg_range_start:avg_range_end])
+        else:
+            idx_safe = min(avg_range_start, n - 1)
+            avg_x = x[idx_safe]
+            avg_y = y[idx_safe]
+
+        range_offs = int(np.floor(i * every) + 1)
+        range_to   = int(np.floor((i + 1) * every) + 1)
+        if range_to >= n:
+            range_to = n
+
+        x_a = x[a]; y_a = y[a]
+        seg_x = x[range_offs:range_to]
+        seg_y = y[range_offs:range_to]
+
+        if seg_x.size == 0:
+            idx = range_offs
+        else:
+            area = np.abs((x_a - avg_x) * (seg_y - y_a) - (y_a - avg_y) * (seg_x - x_a))
+            idx = int(np.argmax(area)) + range_offs
+
+        x_res.append(x[idx])
+        y_res.append(y[idx])
+        a = idx
+
+    x_res.append(x[-1])
+    y_res.append(y[-1])
+    return np.asarray(x_res), np.asarray(y_res)
+
+
+# ---------- Série horaire du prix ----------
+def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_date) -> pd.DataFrame:
+    """
+    Retourne la série **horaire** (fecha+heure -> timestamp) du PML pour un nodo.
+    Colonnes: ['ts','pml']
     """
     mask = (
         (df_all["nodo"] == nodo) &
         (df_all["fecha"] >= pd.to_datetime(start_date)) &
         (df_all["fecha"] <= pd.to_datetime(end_date))
     )
-    sub = df_all.loc[mask, ["fecha", "pml"]].copy()
+    sub = df_all.loc[mask, ["fecha", "hora", "pml"]].dropna().copy()
     if sub.empty:
-        return pd.DataFrame(columns=["fecha", "pml_mean"])
-    s = sub.groupby("fecha", as_index=False)["pml"].mean().rename(columns={"pml": "pml_mean"})
-    return s.sort_values("fecha")
+        return pd.DataFrame(columns=["ts", "pml"])
+    # 'hora' va de 1..24 dans les CSV → ramène à 0..23 pour l'horodatage
+    sub["hora0"] = sub["hora"].astype(int) - 1
+    sub["ts"] = pd.to_datetime(sub["fecha"]) + pd.to_timedelta(sub["hora0"], unit="h")
+    sub = sub.sort_values("ts")[["ts", "pml"]]
+    return sub
 
-def series_to_svg_line(dates: pd.Series, values: pd.Series,
-                       width: int = 560, height: int = 220, pad: int = 28,
-                       stroke_color: str = "#1565C0") -> str:
+# ---------- SVG pour série temporelle dense (timestamps + LTTB) ----------
+def ts_to_svg_line(ts: pd.Series, values: pd.Series,
+                   width: int = 760, height: int = 280, pad: int = 32,
+                   stroke_color: str = "#1565C0",
+                   max_points: int = 1000) -> str:
     """
-    Convertit une série en SVG autonome (axes minimes + polyline).
-    - dates: série de datetime
-    - values: série numérique
+    Rend un SVG (axes minimes + polyline) pour une série temporelle dense.
+    Correction: étiquettes Y -> MAX en haut, MIN en bas (sens attendu).
     """
     import html
-    if len(values) < 2 or values.notna().sum() < 2:
+
+    # Convertit en ndarray
+    ts_dt = pd.to_datetime(ts)
+    x = ts_dt.view("int64").to_numpy(dtype=np.float64)  # ns -> float64
+    y = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]; y = y[mask]
+
+    if x.size < 2:
         return "<div style='font:12px Arial,sans-serif;color:#666'>No price data</div>"
 
-    x_idx = np.arange(len(values), dtype=float)
-    v = values.astype(float).values
+    if x.size > max_points:
+        x, y = lttb_downsample(x, y, threshold=max_points)
 
-    # Échelles
-    x_min, x_max = x_idx.min(), x_idx.max()
-    y_min = np.nanmin(v)
-    y_max = np.nanmax(v)
+    x_min, x_max = float(np.min(x)), float(np.max(x))
+    y_min, y_max = float(np.min(y)), float(np.max(y))
     if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min == y_max:
         y_min = y_min if np.isfinite(y_min) else 0.0
         y_max = y_max if np.isfinite(y_max) else 1.0
         if y_min == y_max:
-            y_min -= 0.5
-            y_max += 0.5
+            y_min -= 0.5; y_max += 0.5
 
     inner_w = width - 2 * pad
     inner_h = height - 2 * pad
 
-    def X(i):
+    def X(xx):
         if x_max == x_min:
             return pad + inner_w / 2
-        return pad + inner_w * ( (i - x_min) / (x_max - x_min) )
+        return pad + inner_w * ((xx - x_min) / (x_max - x_min))
 
     def Y(val):
-        return pad + inner_h * (1 - ( (val - y_min) / (y_max - y_min) ))
+        # Inversion verticale (valeurs hautes affichées en haut)
+        return pad + inner_h * (1 - ((val - y_min) / (y_max - y_min)))
 
-    points = " ".join(f"{X(i):.1f},{Y(val):.1f}" for i, val in zip(x_idx, v) if np.isfinite(val))
+    points = " ".join(f"{X(xx):.1f},{Y(yy):.1f}" for xx, yy in zip(x, y))
 
-    last_val = v[-1]
+    last_val = y[-1]
     min_txt = f"{y_min:,.0f}"
     max_txt = f"{y_max:,.0f}"
     last_txt = f"{last_val:,.0f}"
-    d0 = pd.to_datetime(dates.iloc[0]).date() if len(dates) else ""
-    d1 = pd.to_datetime(dates.iloc[-1]).date() if len(dates) else ""
+    d0 = pd.to_datetime(int(x[0])).date()
+    d1 = pd.to_datetime(int(x[-1])).date()
+
+    # Lignes de grille (quartiles) — optionnel
+    q1_y = Y(y_min + 0.25*(y_max - y_min))
+    q3_y = Y(y_min + 0.75*(y_max - y_min))
 
     svg = f"""
 <svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" style="background:#ffffff">
   <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" stroke="#ddd"/>
+  <!-- Axe Y -->
   <line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height-pad}" stroke="#aaa" stroke-width="1"/>
+
+  <!-- Grille légère -->
+  <line x1="{pad}" y1="{q1_y:.1f}" x2="{width-pad}" y2="{q1_y:.1f}" stroke="#eee" stroke-width="1"/>
+  <line x1="{pad}" y1="{q3_y:.1f}" x2="{width-pad}" y2="{q3_y:.1f}" stroke="#eee" stroke-width="1"/>
+
+  <!-- Étiquettes Y: MAX en haut, MIN en bas -->
   <text x="{pad-4}" y="{pad+10}" font-size="11" text-anchor="end" fill="#666">{html.escape(max_txt)}</text>
   <text x="{pad-4}" y="{height-pad}" font-size="11" text-anchor="end" fill="#666">{html.escape(min_txt)}</text>
+
+  <!-- Étiquettes X -->
   <text x="{pad}" y="{height-4}" font-size="11" text-anchor="start" fill="#666">{html.escape(str(d0))}</text>
   <text x="{width-pad}" y="{height-4}" font-size="11" text-anchor="end" fill="#666">{html.escape(str(d1))}</text>
+
+  <!-- Courbe -->
   <polyline fill="none" stroke="{stroke_color}" stroke-width="2" points="{points}" />
-  <circle cx="{X(x_idx[-1]):.1f}" cy="{Y(last_val):.1f}" r="3" fill="{stroke_color}" />
-  <text x="{X(x_idx[-1])+6:.1f}" y="{Y(last_val)-6:.1f}" font-size="11" fill="#333">{html.escape(last_txt)}</text>
+  <circle cx="{X(x[-1]):.1f}" cy="{Y(last_val):.1f}" r="3" fill="{stroke_color}" />
+  <text x="{X(x[-1])+6:.1f}" y="{Y(last_val)-6:.1f}" font-size="11" fill="#333">{html.escape(last_txt)}</text>
 </svg>
     """
     return svg
 
+
+
 # =========================================================
-# CSV parsing & combination
+# CSV parsing & combinaison
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_cenace_csv_bytes(filename: str, content_bytes: bytes) -> pd.DataFrame:
@@ -622,18 +710,26 @@ else:
         for (_, _), group in grouped:
             pts = jitter_positions(group, radius_m=400)
             for (idx, row), (jlat, jlon) in zip(group.iterrows(), pts):
-                # --- Construire le mini graphe PML moyen journalier pour CE nœud ---
-                ts = build_price_series(df_all, nodo=row["nodo"], start_date=cfg["start_date"], end_date=cfg["end_date"])
-                MAX_POINTS = 200
-                if len(ts) > MAX_POINTS:
-                    ts = ts.iloc[:: max(1, len(ts)//MAX_POINTS) ]
-                svg_chart = series_to_svg_line(ts["fecha"], ts["pml_mean"], width=560, height=220, pad=28)
+                # --- Série HORAIRE + SVG dense (LTTB) pour CE nœud ---
+                ts_hourly = build_price_series_hourly(
+                    df_all,
+                    nodo=row["nodo"],
+                    start_date=cfg["start_date"],
+                    end_date=cfg["end_date"]
+                )
+                svg_chart = ts_to_svg_line(
+                    ts_hourly["ts"],
+                    ts_hourly["pml"],
+                    width=760, height=280, pad=32,
+                    stroke_color="#1565C0",
+                    max_points=1000
+                )
 
                 val = row["avg_spread"]
                 color = "#888888" if pd.isna(val) else cmap(val)
 
                 popup_html = f"""
-<div style="font:13px Arial, sans-serif; min-width: 600px;">
+<div style="font:13px Arial, sans-serif; min-width: 780px;">
   <div style="margin-bottom:6px;">
     <b>Nodo:</b> {_fmt(row.get('nodo'))} &nbsp;|&nbsp;
     <b>Nom:</b> {_fmt(row.get('nombre'))} &nbsp;|&nbsp;
@@ -643,13 +739,13 @@ else:
   <div style="margin-bottom:8px;">
     <b>Avg spread:</b> {(f"{row['avg_spread']:,.2f} $/MWh" if pd.notna(row.get('avg_spread')) else "—")} &nbsp;|&nbsp;
     <b>Days used:</b> {_fmt(row.get('n_days_used'))}<br>
-    <span style="color:#666">Precio promedio diario (PML) — {cfg['start_date']} → {cfg['end_date']}</span>
+    <span style="color:#666">Precio horario (PML) — {cfg['start_date']} → {cfg['end_date']}</span>
   </div>
   <div>{svg_chart}</div>
 </div>
                 """
 
-                popup = folium.Popup(html=popup_html, max_width=1200)
+                popup = folium.Popup(html=popup_html, max_width=1400)
                 tooltip = f"{_fmt(row.get('nodo'))} | {_fmt(row.get('nombre'))}"
 
                 folium.CircleMarker(
@@ -664,4 +760,4 @@ else:
                     popup=popup
                 ).add_to(cluster)
 
-        st_folium(m, width="100%", height=650)
+        st_folium(m, width="100%", height=680)
