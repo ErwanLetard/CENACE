@@ -67,7 +67,6 @@ def _fmt(val):
 # =========================================================
 # Helpers pour courbes (popups)
 # =========================================================
-# ---------- Downsampling LTTB (Largest-Triangle-Three-Buckets) ----------
 def lttb_downsample(x, y, threshold: int):
     """
     LTTB sur des arrays 1D. x et y seront convertis en np.ndarray plats.
@@ -123,8 +122,6 @@ def lttb_downsample(x, y, threshold: int):
     y_res.append(y[-1])
     return np.asarray(x_res), np.asarray(y_res)
 
-
-# ---------- Série horaire du prix ----------
 def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_date) -> pd.DataFrame:
     """
     Retourne la série **horaire** (fecha+heure -> timestamp) du PML pour un nodo.
@@ -144,7 +141,6 @@ def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_d
     sub = sub.sort_values("ts")[["ts", "pml"]]
     return sub
 
-# ---------- SVG pour série temporelle dense (timestamps + LTTB) ----------
 def ts_to_svg_line(ts: pd.Series, values: pd.Series,
                    width: int = 760, height: int = 280, pad: int = 32,
                    stroke_color: str = "#1565C0",
@@ -152,12 +148,12 @@ def ts_to_svg_line(ts: pd.Series, values: pd.Series,
     """
     Rend un SVG (axes minimes + polyline) pour une série temporelle dense.
     Correction: étiquettes Y -> MAX en haut, MIN en bas (sens attendu).
+    Pas de .view('int64'), on utilise astype('int64') pour éviter les FutureWarning.
     """
     import html
 
-    # Convertit en ndarray
     ts_dt = pd.to_datetime(ts)
-    x = ts_dt.view("int64").to_numpy(dtype=np.float64)  # ns -> float64
+    x = ts_dt.astype("int64").to_numpy(dtype=np.float64)  # ns -> float64
     y = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
 
     mask = np.isfinite(x) & np.isfinite(y)
@@ -227,8 +223,6 @@ def ts_to_svg_line(ts: pd.Series, values: pd.Series,
 </svg>
     """
     return svg
-
-
 
 # =========================================================
 # CSV parsing & combinaison
@@ -314,8 +308,14 @@ def combine_uploaded_files(files_meta, files_bytes):
 @st.cache_data(show_spinner=False)
 def compute_daily_spreads_all(df_all: pd.DataFrame, min_hours_per_day: int) -> pd.DataFrame:
     """Calcule une fois tous les spreads journaliers (par nodo/date), avec filtre sur #heures/jour."""
-    counts = df_all.groupby(["nodo", "fecha"], as_index=False)["pml"].count().rename(columns={"pml": "n_hours"})
-    agg = df_all.groupby(["nodo", "fecha"], as_index=False)["pml"].agg(["max", "min"]).reset_index()
+    counts = (
+        df_all.groupby(["nodo", "fecha"], as_index=False, observed=False)["pml"]
+        .count().rename(columns={"pml": "n_hours"})
+    )
+    agg = (
+        df_all.groupby(["nodo", "fecha"], as_index=False, observed=False)["pml"]
+        .agg(["max", "min"]).reset_index()
+    )
     agg["spread"] = agg["max"] - agg["min"]
     out = agg.merge(counts, on=["nodo", "fecha"], how="left")
     out.loc[out["n_hours"] < min_hours_per_day, "spread"] = np.nan
@@ -326,7 +326,7 @@ def compute_avg_spread_from_daily(daily_spread: pd.DataFrame, start_date, end_da
     mask = (daily_spread["fecha"] >= pd.to_datetime(start_date)) & (daily_spread["fecha"] <= pd.to_datetime(end_date))
     subset = daily_spread.loc[mask].copy()
     result = (
-        subset.groupby("nodo", as_index=False)
+        subset.groupby("nodo", as_index=False, observed=False)
               .agg(avg_spread=("spread", "mean"),
                    n_days_used=("spread", lambda s: s.notna().sum()))
     )
@@ -487,7 +487,7 @@ with st.expander("📋 Diagnostics: fichiers chargés", expanded=False):
         _disp = files_info.copy()
         _disp["min_date"] = _disp["min_date"].dt.strftime("%Y-%m-%d")
         _disp["max_date"] = _disp["max_date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(_disp, use_container_width=True)
+        st.dataframe(_disp, width="stretch")
 
 # Bornes pour le date picker
 global_min_date = pd.to_datetime(df_all["fecha"]).min().date()
@@ -576,11 +576,11 @@ result = result.reset_index(drop=True)
 result.insert(0, "rank", np.arange(1, len(result) + 1))
 result = result[["rank", "nodo", "nivel_tension", "avg_spread", "n_days_used"]]
 styled = result.style.format({"avg_spread": "{:,.2f}"})
-st.dataframe(styled, use_container_width=True, hide_index=True)
+st.dataframe(styled, width="stretch", hide_index=True)
 
 st.subheader(f"📈 Top {cfg['top_n']} Nodes by Average Daily Spread (FILTERED)")
 chart_df = result.dropna(subset=["avg_spread"]).head(int(cfg["top_n"]))[["nodo", "avg_spread"]].set_index("nodo")
-st.bar_chart(chart_df)
+st.bar_chart(chart_df, width="stretch")
 
 # Per-node details
 with st.expander("🔎 Per-node daily spreads (within selected range)"):
@@ -590,11 +590,11 @@ with st.expander("🔎 Per-node daily spreads (within selected range)"):
     node_sel = st.selectbox("Select a node", options=nodes_sorted[:5000])
     if node_sel:
         node_daily = daily_in_range[daily_in_range["nodo"] == node_sel].sort_values("fecha")
-        st.dataframe(node_daily, use_container_width=True)
+        st.dataframe(node_daily, width="stretch")
         st.markdown("**Daily spread evolution**")
         if not node_daily.empty:
             series = node_daily.set_index("fecha")["spread"]
-            st.line_chart(series)
+            st.line_chart(series, width="stretch")
         else:
             st.info("No daily spread data available for the selected node and date range.")
 
@@ -710,20 +710,23 @@ else:
         for (_, _), group in grouped:
             pts = jitter_positions(group, radius_m=400)
             for (idx, row), (jlat, jlon) in zip(group.iterrows(), pts):
-                # --- Série HORAIRE + SVG dense (LTTB) pour CE nœud ---
-                ts_hourly = build_price_series_hourly(
-                    df_all,
-                    nodo=row["nodo"],
-                    start_date=cfg["start_date"],
-                    end_date=cfg["end_date"]
-                )
-                svg_chart = ts_to_svg_line(
-                    ts_hourly["ts"],
-                    ts_hourly["pml"],
-                    width=760, height=280, pad=32,
-                    stroke_color="#1565C0",
-                    max_points=1000
-                )
+                # Série HORAIRE + SVG dense (LTTB) pour CE nœud
+                try:
+                    ts_hourly = build_price_series_hourly(
+                        df_all,
+                        nodo=row["nodo"],
+                        start_date=cfg["start_date"],
+                        end_date=cfg["end_date"]
+                    )
+                    svg_chart = ts_to_svg_line(
+                        ts_hourly["ts"],
+                        ts_hourly["pml"],
+                        width=760, height=280, pad=32,
+                        stroke_color="#1565C0",
+                        max_points=1000
+                    )
+                except Exception:
+                    svg_chart = "<div style='font:12px Arial;color:#666'>No price data</div>"
 
                 val = row["avg_spread"]
                 color = "#888888" if pd.isna(val) else cmap(val)
@@ -748,16 +751,28 @@ else:
                 popup = folium.Popup(html=popup_html, max_width=1400)
                 tooltip = f"{_fmt(row.get('nodo'))} | {_fmt(row.get('nombre'))}"
 
-                folium.CircleMarker(
-                    location=[jlat, jlon],
-                    radius=5,
-                    weight=1,
-                    color="#333333",
-                    fill=True,
-                    fill_opacity=0.85,
-                    fill_color=color,
-                    tooltip=tooltip,
-                    popup=popup
-                ).add_to(cluster)
+                try:
+                    folium.CircleMarker(
+                        location=[jlat, jlon],
+                        radius=5,
+                        weight=1,
+                        color="#333333",
+                        fill=True,
+                        fill_opacity=0.85,
+                        fill_color=color,
+                        tooltip=tooltip,
+                        popup=popup
+                    ).add_to(cluster)
+                except Exception:
+                    # Fallback sans popup
+                    folium.CircleMarker(
+                        location=[jlat, jlon],
+                        radius=4,
+                        weight=1,
+                        color="#666",
+                        fill=True,
+                        fill_opacity=0.6,
+                        tooltip=f"{_fmt(row.get('nodo'))}"
+                    ).add_to(cluster)
 
         st_folium(m, width="100%", height=680)
