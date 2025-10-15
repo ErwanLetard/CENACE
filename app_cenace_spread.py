@@ -64,16 +64,10 @@ def _fmt(val):
     s = str(val).strip()
     return "—" if s == "" or s.lower() == "nan" else s
 
-# --- Fallback coords pour certaines 'zona de carga' VDM ---
-ZC_FALLBACK_COORDS = {
-    "vdm centro": (19.4326, -99.1332),  # Centre CDMX
-    "vdm norte":  (19.55,   -99.14),    # Nord CDMX approx
-    "vdm sur":    (19.31,   -99.16),    # Sud CDMX approx
-}
-
 # =========================================================
 # Helpers pour courbes (popups)
 # =========================================================
+# ---------- Downsampling LTTB (Largest-Triangle-Three-Buckets) ----------
 def lttb_downsample(x, y, threshold: int):
     """
     LTTB sur des arrays 1D. x et y seront convertis en np.ndarray plats.
@@ -129,6 +123,8 @@ def lttb_downsample(x, y, threshold: int):
     y_res.append(y[-1])
     return np.asarray(x_res), np.asarray(y_res)
 
+
+# ---------- Série horaire du prix ----------
 def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_date) -> pd.DataFrame:
     """
     Retourne la série **horaire** (fecha+heure -> timestamp) du PML pour un nodo.
@@ -142,11 +138,13 @@ def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_d
     sub = df_all.loc[mask, ["fecha", "hora", "pml"]].dropna().copy()
     if sub.empty:
         return pd.DataFrame(columns=["ts", "pml"])
-    sub["hora0"] = sub["hora"].astype(int) - 1  # CSV: 1..24 → timestamp: 0..23
+    # 'hora' va de 1..24 dans les CSV → ramène à 0..23 pour l'horodatage
+    sub["hora0"] = sub["hora"].astype(int) - 1
     sub["ts"] = pd.to_datetime(sub["fecha"]) + pd.to_timedelta(sub["hora0"], unit="h")
     sub = sub.sort_values("ts")[["ts", "pml"]]
     return sub
 
+# ---------- SVG pour série temporelle dense (timestamps + LTTB) ----------
 def ts_to_svg_line(ts: pd.Series, values: pd.Series,
                    width: int = 760, height: int = 280, pad: int = 32,
                    stroke_color: str = "#1565C0",
@@ -158,7 +156,7 @@ def ts_to_svg_line(ts: pd.Series, values: pd.Series,
     import html
 
     ts_dt = pd.to_datetime(ts)
-    # .view est déprécié → utilise .astype('int64')
+    # .view("int64") est déprécié sur pandas récents → utilise astype
     x = ts_dt.astype("int64").to_numpy(dtype=np.float64)  # ns -> float64
     y = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
 
@@ -332,6 +330,51 @@ def compute_avg_spread_from_daily(daily_spread: pd.DataFrame, start_date, end_da
     result = result.sort_values("avg_spread", ascending=False, na_position="last")
     return result
 
+# ----------------- NEW: rolling-window daily spread -----------------
+@st.cache_data(show_spinner=False)
+def compute_window_spreads_all(df_all: pd.DataFrame, window_h: int, min_hours_per_day: int) -> pd.DataFrame:
+    """
+    Pour chaque (nodo, fecha), calcule le spread basé sur des fenêtres glissantes
+    de taille 'window_h' (rolling mean des prix horaires sur la journée):
+        spread_win(day) = max(rolling_mean(window_h)) - min(rolling_mean(window_h))
+    On exige au moins max(min_hours_per_day, window_h) points horaires valides dans la journée.
+    Retourne: ['nodo','fecha','spread_win','n_hours']
+    """
+    tmp = df_all[["nodo", "fecha", "hora", "pml"]].copy()
+    tmp["hora"] = pd.to_numeric(tmp["hora"], errors="coerce")
+    tmp = tmp.dropna(subset=["nodo", "fecha", "hora", "pml"])
+
+    def _per_day(g: pd.DataFrame) -> pd.Series:
+        day = (
+            g.sort_values("hora")
+             .set_index("hora")
+             .reindex(range(1, 25))
+        )
+        n_hours = day["pml"].count()
+        rm = day["pml"].rolling(window=window_h, min_periods=window_h).mean()
+        spread = (rm.max() - rm.min()) if rm.notna().any() else np.nan
+        return pd.Series({"spread_win": spread, "n_hours": n_hours})
+
+    out = tmp.groupby(["nodo", "fecha"], observed=False).apply(_per_day, include_groups=False).reset_index()
+    min_need = max(int(min_hours_per_day), int(window_h))
+    out.loc[out["n_hours"] < min_need, "spread_win"] = np.nan
+    return out[["nodo", "fecha", "spread_win", "n_hours"]]
+
+def compute_avg_window_spread(daily_win: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    """
+    Filtre par dates et calcule la moyenne de spread_win par nodo.
+    Retourne colonnes: ['nodo','avg_spread_win','n_days_used']
+    """
+    mask = (daily_win["fecha"] >= pd.to_datetime(start_date)) & (daily_win["fecha"] <= pd.to_datetime(end_date))
+    subset = daily_win.loc[mask].copy()
+    res = (
+        subset.groupby("nodo", as_index=False)
+              .agg(avg_spread_win=("spread_win", "mean"),
+                   n_days_used=("spread_win", lambda s: s.notna().sum()))
+    )
+    res = res.sort_values("avg_spread_win", ascending=False, na_position="last")
+    return res
+
 # =========================================================
 # NodosP Excel + Gazetteer (offline-first)
 # =========================================================
@@ -400,35 +443,33 @@ def geocode_city_cached(city_norm: str) -> tuple:
 def build_city_coordinates(city_series: pd.Series,
                            gazetteer_df: pd.DataFrame | None,
                            allow_online_geocoding: bool) -> pd.DataFrame:
-    """
-    Construit un mapping city_norm -> (lat,lon) en priorité :
-      0) Fallbacks codés en dur pour 'VDM CENTRO/NORTE/SUR'
-      1) Gazetteer fourni
-      2) Géocodage en ligne (si autorisé)
-    """
+    """Construit un mapping city_norm -> (lat,lon) via gazetteer puis géocodage si besoin. Ajoute VDM NORTE/CENTRO/SUR."""
     cities = pd.Series(city_series.dropna().astype(str).unique())
-    mapping = pd.DataFrame({"city_norm": cities.map(normalize_city)}).drop_duplicates()
+    cities_norm = cities.map(normalize_city)
+    mapping = pd.DataFrame({"city_norm": cities_norm}).drop_duplicates()
     mapping["lat"] = np.nan
     mapping["lon"] = np.nan
 
-    # 0) Fallback dur pour VDM
-    if not mapping.empty:
-        mask_vdm = mapping["city_norm"].isin(ZC_FALLBACK_COORDS.keys())
-        for idx in mapping.index[mask_vdm]:
-            lat, lon = ZC_FALLBACK_COORDS[mapping.at[idx, "city_norm"]]
-            mapping.at[idx, "lat"] = lat
-            mapping.at[idx, "lon"] = lon
+    # Règles spéciales VDM
+    vdm_rules = {
+        "vdm norte":  (26.0, -102.5),  # Nord (approx)
+        "vdm centro": (20.5, -101.0),  # Centre (approx)
+        "vdm sur":    (17.0, -99.0),   # Sud (approx)
+    }
+    for k, (la, lo) in vdm_rules.items():
+        mask = mapping["city_norm"].str.contains(k, na=False)
+        mapping.loc[mask, ["lat", "lon"]] = (la, lo)
 
-    # 1) Gazetteer (ne remplit que les manquants)
+    # Gazetteer d'abord
     if gazetteer_df is not None and not gazetteer_df.empty:
-        mapping = mapping.merge(gazetteer_df, on="city_norm", how="left", suffixes=("", "_gaz"))
+        mapping = mapping.merge(gazetteer_df, on="city_norm", how="left", suffixes=("","_gaz"))
         mapping["lat"] = mapping["lat"].where(mapping["lat"].notna(), mapping.get("lat_gaz"))
         mapping["lon"] = mapping["lon"].where(mapping["lon"].notna(), mapping.get("lon_gaz"))
-        for col in ("lat_gaz", "lon_gaz"):
+        for col in ["lat_gaz","lon_gaz"]:
             if col in mapping.columns:
-                mapping.drop(columns=col, inplace=True)
+                mapping = mapping.drop(columns=[col])
 
-    # 2) Géocodage en ligne pour le reste
+    # Géocodage si toujours manquant
     if allow_online_geocoding:
         mask_missing = mapping["lat"].isna() | mapping["lon"].isna()
         if mask_missing.any():
@@ -437,10 +478,7 @@ def build_city_coordinates(city_series: pd.Series,
             done = 0
             for idx in mapping.index[mask_missing]:
                 c = mapping.at[idx, "city_norm"]
-                if c in ZC_FALLBACK_COORDS:
-                    lat, lon = ZC_FALLBACK_COORDS[c]  # sécurité redondante
-                else:
-                    lat, lon = geocode_city_cached(c)
+                lat, lon = geocode_city_cached(c)
                 mapping.at[idx, "lat"] = lat
                 mapping.at[idx, "lon"] = lon
                 done += 1
@@ -529,6 +567,22 @@ with st.sidebar.form("settings_form"):
         start_date, end_date = start_date
     top_n = st.number_input("Show Top N nodes (table/chart)", min_value=5, max_value=200, value=50, step=5)
 
+    # ----- métrique spread -----
+    metric_mode = st.radio(
+        "Spread metric",
+        options=["Daily max–min", "Rolling-window spread"],
+        index=0,
+        help="Daily max–min = max(pml) - min(pml) sur la journée.\n"
+             "Rolling-window = max(moyenne glissante Hh) - min(moyenne glissante Hh)."
+    )
+
+    window_h = st.select_slider(
+        "Window size (hours) for rolling-window",
+        options=[2, 4, 8, 12],
+        value=4,
+        help="Utilisé uniquement pour 'Rolling-window spread'."
+    )
+
     map_subset_mode = st.radio(
         "Nodes to show on the map",
         options=["All filtered nodes", "Top N by avg spread"],
@@ -547,7 +601,9 @@ if submitted or "cfg" not in st.session_state:
         "top_n": int(top_n),
         "map_subset_mode": map_subset_mode,
         "map_top_n": int(map_top_n),
-        "allow_online_geocoding": bool(allow_online_geocoding)
+        "allow_online_geocoding": bool(allow_online_geocoding),
+        "metric_mode": metric_mode,
+        "window_h": int(window_h),
     }
 cfg = st.session_state["cfg"]
 
@@ -558,7 +614,7 @@ with st.spinner("Calcul des spreads journaliers (cache)..."):
     daily_all = compute_daily_spreads_all(df_all, min_hours_per_day=cfg["min_hours"])
 
 # =========================================================
-# Filtres
+# Filtres (tension)
 # =========================================================
 voltage_map = df_all[["nodo", "nivel_tension"]].drop_duplicates()
 daily_all = daily_all.merge(voltage_map, on="nodo", how="left")
@@ -578,28 +634,59 @@ colA.metric("Nodes (filtered)", f"{daily_filtered['nodo'].nunique():,}")
 colB.metric("Dates (filtered)", f"{daily_filtered['fecha'].nunique():,}")
 colC.metric("Records (daily rows)", f"{len(daily_filtered):,}")
 
-# Table & Chart des spreads moyens
-result = compute_avg_spread_from_daily(daily_filtered, cfg["start_date"], cfg["end_date"])
-result = result.merge(voltage_map, on="nodo", how="left")
+# ===================== NEW: compute chosen metric =====================
+metric_mode = cfg.get("metric_mode", "Daily max–min")
+window_h = cfg.get("window_h", 4)
 
-st.subheader("🏆 Average Daily Spread by Node (selected period, FILTERED)")
+if metric_mode == "Daily max–min":
+    result = compute_avg_spread_from_daily(daily_filtered, cfg["start_date"], cfg["end_date"])
+    result = result.merge(voltage_map, on="nodo", how="left")
+    metric_col = "avg_spread"
+    metric_label = "Average Daily Spread"
+else:
+    with st.spinner(f"Computing {window_h}h rolling-window daily spreads... (cached)"):
+        daily_win_all = compute_window_spreads_all(df_all, window_h=window_h, min_hours_per_day=cfg["min_hours"])
+    daily_win_all = daily_win_all.merge(voltage_map, on="nodo", how="left")
+    if cfg["selected_levels"]:
+        daily_win_filtered = daily_win_all[daily_win_all["nivel_tension"].astype(str).isin(cfg["selected_levels"])].copy()
+    else:
+        st.warning("No voltage levels selected — results will be empty.")
+        daily_win_filtered = daily_win_all.iloc[0:0].copy()
+    result = compute_avg_window_spread(daily_win_filtered, cfg["start_date"], cfg["end_date"])
+    result = result.merge(voltage_map, on="nodo", how="left")
+    metric_col = "avg_spread_win"
+    metric_label = f"Average {window_h}h Rolling-Window Spread"
+
+# =========================================================
+# Table & Chart des spreads moyens
+# =========================================================
+st.subheader(f"🏆 {metric_label} by Node (selected period, FILTERED)")
 st.write(
     f"From **{cfg['start_date']}** to **{cfg['end_date']}** | "
     f"Min hours/day: **{cfg['min_hours']}** | "
     f"Voltage levels: {', '.join(cfg['selected_levels']) if cfg['selected_levels'] else '—'}"
+    + (f" | Window: **{window_h}h**" if metric_mode != "Daily max–min" else "")
 )
+
 result = result.reset_index(drop=True)
 result.insert(0, "rank", np.arange(1, len(result) + 1))
-result = result[["rank", "nodo", "nivel_tension", "avg_spread", "n_days_used"]]
-styled = result.style.format({"avg_spread": "{:,.2f}"})
+result_cols = ["rank", "nodo", "nivel_tension", metric_col, "n_days_used"]
+styled = result[result_cols].style.format({metric_col: "{:,.2f}"})
 st.dataframe(styled, width="stretch", hide_index=True)
 
-st.subheader(f"📈 Top {cfg['top_n']} Nodes by Average Daily Spread (FILTERED)")
-chart_df = result.dropna(subset=["avg_spread"]).head(int(cfg["top_n"]))[["nodo", "avg_spread"]].set_index("nodo")
+st.subheader(f"📈 Top {cfg['top_n']} Nodes by {metric_label} (FILTERED)")
+chart_df = (
+    result.dropna(subset=[metric_col])
+          .head(int(cfg["top_n"]))[["nodo", metric_col]]
+          .set_index("nodo")
+)
 st.bar_chart(chart_df)
 
+# =========================================================
 # Per-node details
+# =========================================================
 with st.expander("🔎 Per-node daily spreads (within selected range)"):
+    st.caption(f"Detail table above uses: {metric_label}.")
     mask = (daily_filtered["fecha"] >= pd.to_datetime(cfg["start_date"])) & (daily_filtered["fecha"] <= pd.to_datetime(cfg["end_date"]))
     daily_in_range = daily_filtered.loc[mask].copy()
     nodes_sorted = result["nodo"].dropna().tolist()
@@ -607,7 +694,7 @@ with st.expander("🔎 Per-node daily spreads (within selected range)"):
     if node_sel:
         node_daily = daily_in_range[daily_in_range["nodo"] == node_sel].sort_values("fecha")
         st.dataframe(node_daily, width="stretch")
-        st.markdown("**Daily spread evolution**")
+        st.markdown("**Daily spread evolution (max–min)**")
         if not node_daily.empty:
             series = node_daily.set_index("fecha")["spread"]
             st.line_chart(series)
@@ -617,7 +704,7 @@ with st.expander("🔎 Per-node daily spreads (within selected range)"):
 # =========================================================
 # 🗺️ Carte des nœuds (Folium) — n’affiche que les nœuds filtrés
 # =========================================================
-st.subheader("🗺️ Nodos map (colored by average daily spread)")
+st.subheader("🗺️ Nodos map (colored by selected spread metric)")
 
 # Charger NodosP (upload > chemin local)
 nodosp_df = None
@@ -649,23 +736,24 @@ if nodosp_errors:
 if nodosp_df is None:
     st.info("Fournis le fichier Excel NodosP (upload ou chemin local) pour activer la carte.")
 else:
-    # Ne garder QUE les nœuds filtrés (tension + période)
-    nodes_for_map = result.copy()
+    # ----- nodes_for_map: seulement les nœuds filtrés, avec la métrique choisie -----
+    nodes_for_map = result.copy()  # contient soit avg_spread, soit avg_spread_win
     if cfg["selected_levels"]:
         nodes_for_map = nodes_for_map[nodes_for_map["nivel_tension"].astype(str).isin(cfg["selected_levels"])]
 
-    # Préparer NodosP: s'assurer que les colonnes existent
+    # Préparer NodosP: colonnes sûres
     for col in ["nodo", "ciudad", "nombre"]:
         if col not in nodosp_df.columns:
             nodosp_df[col] = np.nan
     nodosp_df = nodosp_df[["nodo", "ciudad", "nombre"]].drop_duplicates(subset=["nodo"])
 
-    # Jointure LEFT sur nodes_for_map ⇒ la carte n'affiche que les nœuds filtrés
+    # Jointure LEFT sur nodes_for_map
     map_df = nodes_for_map.merge(nodosp_df, on="nodo", how="left")
 
-    # Option: limiter la carte au Top N par avg_spread
+    # Option: limiter la carte au Top N par métrique active
+    value_col = "avg_spread" if metric_mode == "Daily max–min" else "avg_spread_win"
     if cfg.get("map_subset_mode") == "Top N by avg spread":
-        map_df = map_df.dropna(subset=["avg_spread"]).sort_values("avg_spread", ascending=False).head(int(cfg.get("map_top_n", 200)))
+        map_df = map_df.dropna(subset=[value_col]).sort_values(value_col, ascending=False).head(int(cfg.get("map_top_n", 200)))
 
     # Export d’un template de villes à compléter (offline)
     unique_cities = (
@@ -707,30 +795,26 @@ else:
             "Uploade un gazetteer (city,lat,lon) ou active le géocodage en ligne."
         )
     else:
-        # Échelle de couleur sur avg_spread
-        vmin = float(have_coords["avg_spread"].min()) if have_coords["avg_spread"].notna().any() else 0.0
-        vmax = float(have_coords["avg_spread"].max()) if have_coords["avg_spread"].notna().any() else 1.0
+        # Échelle de couleur sur la métrique active
+        vmin = float(have_coords[value_col].min()) if have_coords[value_col].notna().any() else 0.0
+        vmax = float(have_coords[value_col].max()) if have_coords[value_col].notna().any() else 1.0
         cmap = linear.YlOrRd_09.scale(vmin, vmax) if math.isfinite(vmin) and math.isfinite(vmax) and vmin != vmax else linear.YlOrRd_09.scale(0, 1)
 
         # Base map centrée sur le Mexique
         m = folium.Map(location=[23.5, -102.0], zoom_start=5, tiles="cartodbpositron")
-        cmap.caption = "Average daily spread ($/MWh)"
+        cmap.caption = f"{'Avg Daily Spread' if metric_mode=='Daily max–min' else f'Avg {window_h}h Window Spread'} ($/MWh)"
         cmap.add_to(m)
 
         have_coords["lat"] = have_coords["lat"].astype(float)
         have_coords["lon"] = have_coords["lon"].astype(float)
         cluster = MarkerCluster(name="Nodos").add_to(m)
 
-        # Préparer un daily_in_range pour les popups (prix horaires)
-        mask = (daily_filtered["fecha"] >= pd.to_datetime(cfg["start_date"])) & (daily_filtered["fecha"] <= pd.to_datetime(cfg["end_date"]))
-        daily_in_range = daily_filtered.loc[mask].copy()  # (on s'en sert seulement pour les nodos présents)
-
         # Jitter par groupe de coordonnées identiques
         grouped = have_coords.groupby(["lat", "lon"], as_index=False, sort=False)
         for (_, _), group in grouped:
             pts = jitter_positions(group, radius_m=400)
             for (idx, row), (jlat, jlon) in zip(group.iterrows(), pts):
-                # Série horaire + SVG
+                # --- Série HORAIRE + SVG dense (LTTB) pour CE nœud ---
                 ts_hourly = build_price_series_hourly(
                     df_all,
                     nodo=row["nodo"],
@@ -745,9 +829,10 @@ else:
                     max_points=1000
                 )
 
-                val = row["avg_spread"]
+                val = row.get(value_col, np.nan)
                 color = "#888888" if pd.isna(val) else cmap(val)
 
+                chart_note = ""  # placeholder si besoin d’un message
                 popup_html = f"""
 <div style="font:13px Arial, sans-serif; min-width: 780px;">
   <div style="margin-bottom:6px;">
@@ -757,11 +842,13 @@ else:
     <b>Ciudad:</b> {_fmt(row.get('ciudad'))}
   </div>
   <div style="margin-bottom:8px;">
-    <b>Avg spread:</b> {(f"{row['avg_spread']:,.2f} $/MWh" if pd.notna(row.get('avg_spread')) else "—")} &nbsp;|&nbsp;
+    <b>{'Avg Daily Spread' if metric_mode=='Daily max–min' else f'Avg {window_h}h Window Spread'}:</b>
+    {(f"{val:,.2f} $/MWh" if pd.notna(val) else "—")} &nbsp;|&nbsp;
     <b>Days used:</b> {_fmt(row.get('n_days_used'))}<br>
     <span style="color:#666">Precio horario (PML) — {cfg['start_date']} → {cfg['end_date']}</span>
   </div>
   <div>{svg_chart}</div>
+  {chart_note}
 </div>
                 """
 
