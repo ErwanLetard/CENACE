@@ -64,6 +64,13 @@ def _fmt(val):
     s = str(val).strip()
     return "—" if s == "" or s.lower() == "nan" else s
 
+# --- Fallback coords pour certaines 'zona de carga' VDM ---
+ZC_FALLBACK_COORDS = {
+    "vdm centro": (19.4326, -99.1332),  # Centre CDMX
+    "vdm norte":  (19.55,   -99.14),    # Nord CDMX approx
+    "vdm sur":    (19.31,   -99.16),    # Sud CDMX approx
+}
+
 # =========================================================
 # Helpers pour courbes (popups)
 # =========================================================
@@ -135,8 +142,7 @@ def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_d
     sub = df_all.loc[mask, ["fecha", "hora", "pml"]].dropna().copy()
     if sub.empty:
         return pd.DataFrame(columns=["ts", "pml"])
-    # 'hora' va de 1..24 dans les CSV → ramène à 0..23 pour l'horodatage
-    sub["hora0"] = sub["hora"].astype(int) - 1
+    sub["hora0"] = sub["hora"].astype(int) - 1  # CSV: 1..24 → timestamp: 0..23
     sub["ts"] = pd.to_datetime(sub["fecha"]) + pd.to_timedelta(sub["hora0"], unit="h")
     sub = sub.sort_values("ts")[["ts", "pml"]]
     return sub
@@ -148,11 +154,11 @@ def ts_to_svg_line(ts: pd.Series, values: pd.Series,
     """
     Rend un SVG (axes minimes + polyline) pour une série temporelle dense.
     Correction: étiquettes Y -> MAX en haut, MIN en bas (sens attendu).
-    Pas de .view('int64'), on utilise astype('int64') pour éviter les FutureWarning.
     """
     import html
 
     ts_dt = pd.to_datetime(ts)
+    # .view est déprécié → utilise .astype('int64')
     x = ts_dt.astype("int64").to_numpy(dtype=np.float64)  # ns -> float64
     y = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
 
@@ -194,7 +200,6 @@ def ts_to_svg_line(ts: pd.Series, values: pd.Series,
     d0 = pd.to_datetime(int(x[0])).date()
     d1 = pd.to_datetime(int(x[-1])).date()
 
-    # Lignes de grille (quartiles) — optionnel
     q1_y = Y(y_min + 0.25*(y_max - y_min))
     q3_y = Y(y_min + 0.75*(y_max - y_min))
 
@@ -308,14 +313,8 @@ def combine_uploaded_files(files_meta, files_bytes):
 @st.cache_data(show_spinner=False)
 def compute_daily_spreads_all(df_all: pd.DataFrame, min_hours_per_day: int) -> pd.DataFrame:
     """Calcule une fois tous les spreads journaliers (par nodo/date), avec filtre sur #heures/jour."""
-    counts = (
-        df_all.groupby(["nodo", "fecha"], as_index=False, observed=False)["pml"]
-        .count().rename(columns={"pml": "n_hours"})
-    )
-    agg = (
-        df_all.groupby(["nodo", "fecha"], as_index=False, observed=False)["pml"]
-        .agg(["max", "min"]).reset_index()
-    )
+    counts = df_all.groupby(["nodo", "fecha"], as_index=False)["pml"].count().rename(columns={"pml": "n_hours"})
+    agg = df_all.groupby(["nodo", "fecha"], as_index=False)["pml"].agg(["max", "min"]).reset_index()
     agg["spread"] = agg["max"] - agg["min"]
     out = agg.merge(counts, on=["nodo", "fecha"], how="left")
     out.loc[out["n_hours"] < min_hours_per_day, "spread"] = np.nan
@@ -326,7 +325,7 @@ def compute_avg_spread_from_daily(daily_spread: pd.DataFrame, start_date, end_da
     mask = (daily_spread["fecha"] >= pd.to_datetime(start_date)) & (daily_spread["fecha"] <= pd.to_datetime(end_date))
     subset = daily_spread.loc[mask].copy()
     result = (
-        subset.groupby("nodo", as_index=False, observed=False)
+        subset.groupby("nodo", as_index=False)
               .agg(avg_spread=("spread", "mean"),
                    n_days_used=("spread", lambda s: s.notna().sum()))
     )
@@ -401,21 +400,35 @@ def geocode_city_cached(city_norm: str) -> tuple:
 def build_city_coordinates(city_series: pd.Series,
                            gazetteer_df: pd.DataFrame | None,
                            allow_online_geocoding: bool) -> pd.DataFrame:
-    """Construit un mapping city_norm -> (lat,lon) via gazetteer puis géocodage si besoin."""
+    """
+    Construit un mapping city_norm -> (lat,lon) en priorité :
+      0) Fallbacks codés en dur pour 'VDM CENTRO/NORTE/SUR'
+      1) Gazetteer fourni
+      2) Géocodage en ligne (si autorisé)
+    """
     cities = pd.Series(city_series.dropna().astype(str).unique())
-    cities_norm = cities.map(normalize_city)
-    mapping = pd.DataFrame({"city_norm": cities_norm}).drop_duplicates()
+    mapping = pd.DataFrame({"city_norm": cities.map(normalize_city)}).drop_duplicates()
     mapping["lat"] = np.nan
     mapping["lon"] = np.nan
 
+    # 0) Fallback dur pour VDM
+    if not mapping.empty:
+        mask_vdm = mapping["city_norm"].isin(ZC_FALLBACK_COORDS.keys())
+        for idx in mapping.index[mask_vdm]:
+            lat, lon = ZC_FALLBACK_COORDS[mapping.at[idx, "city_norm"]]
+            mapping.at[idx, "lat"] = lat
+            mapping.at[idx, "lon"] = lon
+
+    # 1) Gazetteer (ne remplit que les manquants)
     if gazetteer_df is not None and not gazetteer_df.empty:
-        mapping = mapping.merge(gazetteer_df, on="city_norm", how="left", suffixes=("","_gaz"))
+        mapping = mapping.merge(gazetteer_df, on="city_norm", how="left", suffixes=("", "_gaz"))
         mapping["lat"] = mapping["lat"].where(mapping["lat"].notna(), mapping.get("lat_gaz"))
         mapping["lon"] = mapping["lon"].where(mapping["lon"].notna(), mapping.get("lon_gaz"))
-        for col in ["lat_gaz","lon_gaz"]:
+        for col in ("lat_gaz", "lon_gaz"):
             if col in mapping.columns:
-                mapping = mapping.drop(columns=[col])
+                mapping.drop(columns=col, inplace=True)
 
+    # 2) Géocodage en ligne pour le reste
     if allow_online_geocoding:
         mask_missing = mapping["lat"].isna() | mapping["lon"].isna()
         if mask_missing.any():
@@ -424,7 +437,10 @@ def build_city_coordinates(city_series: pd.Series,
             done = 0
             for idx in mapping.index[mask_missing]:
                 c = mapping.at[idx, "city_norm"]
-                lat, lon = geocode_city_cached(c)
+                if c in ZC_FALLBACK_COORDS:
+                    lat, lon = ZC_FALLBACK_COORDS[c]  # sécurité redondante
+                else:
+                    lat, lon = geocode_city_cached(c)
                 mapping.at[idx, "lat"] = lat
                 mapping.at[idx, "lon"] = lon
                 done += 1
@@ -580,7 +596,7 @@ st.dataframe(styled, width="stretch", hide_index=True)
 
 st.subheader(f"📈 Top {cfg['top_n']} Nodes by Average Daily Spread (FILTERED)")
 chart_df = result.dropna(subset=["avg_spread"]).head(int(cfg["top_n"]))[["nodo", "avg_spread"]].set_index("nodo")
-st.bar_chart(chart_df, width="stretch")
+st.bar_chart(chart_df)
 
 # Per-node details
 with st.expander("🔎 Per-node daily spreads (within selected range)"):
@@ -594,7 +610,7 @@ with st.expander("🔎 Per-node daily spreads (within selected range)"):
         st.markdown("**Daily spread evolution**")
         if not node_daily.empty:
             series = node_daily.set_index("fecha")["spread"]
-            st.line_chart(series, width="stretch")
+            st.line_chart(series)
         else:
             st.info("No daily spread data available for the selected node and date range.")
 
@@ -705,28 +721,29 @@ else:
         have_coords["lon"] = have_coords["lon"].astype(float)
         cluster = MarkerCluster(name="Nodos").add_to(m)
 
+        # Préparer un daily_in_range pour les popups (prix horaires)
+        mask = (daily_filtered["fecha"] >= pd.to_datetime(cfg["start_date"])) & (daily_filtered["fecha"] <= pd.to_datetime(cfg["end_date"]))
+        daily_in_range = daily_filtered.loc[mask].copy()  # (on s'en sert seulement pour les nodos présents)
+
         # Jitter par groupe de coordonnées identiques
         grouped = have_coords.groupby(["lat", "lon"], as_index=False, sort=False)
         for (_, _), group in grouped:
             pts = jitter_positions(group, radius_m=400)
             for (idx, row), (jlat, jlon) in zip(group.iterrows(), pts):
-                # Série HORAIRE + SVG dense (LTTB) pour CE nœud
-                try:
-                    ts_hourly = build_price_series_hourly(
-                        df_all,
-                        nodo=row["nodo"],
-                        start_date=cfg["start_date"],
-                        end_date=cfg["end_date"]
-                    )
-                    svg_chart = ts_to_svg_line(
-                        ts_hourly["ts"],
-                        ts_hourly["pml"],
-                        width=760, height=280, pad=32,
-                        stroke_color="#1565C0",
-                        max_points=1000
-                    )
-                except Exception:
-                    svg_chart = "<div style='font:12px Arial;color:#666'>No price data</div>"
+                # Série horaire + SVG
+                ts_hourly = build_price_series_hourly(
+                    df_all,
+                    nodo=row["nodo"],
+                    start_date=cfg["start_date"],
+                    end_date=cfg["end_date"]
+                )
+                svg_chart = ts_to_svg_line(
+                    ts_hourly["ts"],
+                    ts_hourly["pml"],
+                    width=760, height=280, pad=32,
+                    stroke_color="#1565C0",
+                    max_points=1000
+                )
 
                 val = row["avg_spread"]
                 color = "#888888" if pd.isna(val) else cmap(val)
@@ -751,28 +768,16 @@ else:
                 popup = folium.Popup(html=popup_html, max_width=1400)
                 tooltip = f"{_fmt(row.get('nodo'))} | {_fmt(row.get('nombre'))}"
 
-                try:
-                    folium.CircleMarker(
-                        location=[jlat, jlon],
-                        radius=5,
-                        weight=1,
-                        color="#333333",
-                        fill=True,
-                        fill_opacity=0.85,
-                        fill_color=color,
-                        tooltip=tooltip,
-                        popup=popup
-                    ).add_to(cluster)
-                except Exception:
-                    # Fallback sans popup
-                    folium.CircleMarker(
-                        location=[jlat, jlon],
-                        radius=4,
-                        weight=1,
-                        color="#666",
-                        fill=True,
-                        fill_opacity=0.6,
-                        tooltip=f"{_fmt(row.get('nodo'))}"
-                    ).add_to(cluster)
+                folium.CircleMarker(
+                    location=[jlat, jlon],
+                    radius=5,
+                    weight=1,
+                    color="#333333",
+                    fill=True,
+                    fill_opacity=0.85,
+                    fill_color=color,
+                    tooltip=tooltip,
+                    popup=popup
+                ).add_to(cluster)
 
         st_folium(m, width="100%", height=680)
