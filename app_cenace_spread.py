@@ -118,10 +118,37 @@ def list_release_assets(owner_repo: str, tag: str) -> list[dict]:
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    r = requests.get(url, headers=headers, timeout=20)
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        st.error(f"GitHub request failed for tag {tag}: {exc}")
+        return []
     if r.status_code == 404:
         return []
-    r.raise_for_status()
+    if r.status_code == 403:
+        remaining = r.headers.get("X-RateLimit-Remaining")
+        if remaining == "0":
+            reset_ts = r.headers.get("X-RateLimit-Reset")
+            if reset_ts:
+                try:
+                    reset_dt = pd.to_datetime(int(reset_ts), unit="s").tz_localize("UTC").tz_convert("America/Mexico_City")
+                    reset_msg = reset_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                except Exception:
+                    reset_msg = reset_ts
+                st.error(
+                    "GitHub API rate limit exceeded. Set `GITHUB_TOKEN` in Streamlit secrets "
+                    f"or retry after {reset_msg}."
+                )
+            else:
+                st.error("GitHub API rate limit exceeded. Add `GITHUB_TOKEN` or retry later.")
+        else:
+            st.error(f"GitHub API returned 403 for release {tag}. Check credentials.")
+        return []
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as exc:
+        st.error(f"GitHub call failed for release {tag}: {exc}")
+        return []
     data = r.json()
     out = []
     for a in data.get("assets", []) or []:
