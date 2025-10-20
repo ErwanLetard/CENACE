@@ -533,10 +533,11 @@ def compute_window_spreads_all(df_all: pd.DataFrame, window_h: int, min_hours_pe
     rolling_stats = (
         rolling_mean.groupby(level=["nodo", "fecha"])
                     .agg(["max", "min"])
-                    .droplevel(0, axis=1)
-                    .rename(columns={"max": "rolling_max", "min": "rolling_min"})
                     .reset_index()
     )
+    if isinstance(rolling_stats.columns, pd.MultiIndex):
+        rolling_stats.columns = rolling_stats.columns.droplevel(0)
+    rolling_stats = rolling_stats.rename(columns={"max": "rolling_max", "min": "rolling_min"})
     rolling_stats["spread_win"] = rolling_stats["rolling_max"] - rolling_stats["rolling_min"]
     rolling_stats = rolling_stats[["nodo", "fecha", "spread_win"]]
 
