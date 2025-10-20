@@ -282,8 +282,8 @@ def month_keys_from_period(start_date: date, end_date: date) -> List[str]:
 
 @st.cache_data(show_spinner=False)
 def load_all_prices(
-    start_date: date,
-    end_date: date,
+    start_date,
+    end_date,
     manifest: Dict[str, Dict[str, str]],
     repo: str,
     token: Optional[str],
@@ -313,10 +313,14 @@ def load_all_prices(
     nodo_series = df_all["nodo"].astype(str).str.strip()
     df_all["nodo"] = nodo_series
     df_all["nivel_tension"] = nodo_series.str.extract(_VOLTAGE_SUFFIX_RE, expand=False)
-    df_all["fecha"] = pd.to_datetime(df_all["fecha"]).dt.date
+    fechas_full = pd.to_datetime(df_all["fecha"], errors="coerce")
+    df_all["fecha"] = fechas_full
     df_all["hora"] = df_all["hora"].astype(int)
-    mask = (df_all["fecha"] >= start_date) & (df_all["fecha"] <= end_date)
-    df_all = df_all.loc[mask]
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date)
+    mask = (fechas_full >= start_ts) & (fechas_full <= end_ts)
+    df_all = df_all.loc[mask].copy()
+    df_all["fecha"] = fechas_full[mask].dt.date
     try:
         df_all["nodo"] = df_all["nodo"].astype("category")
         df_all["nivel_tension"] = df_all["nivel_tension"].astype("category")
