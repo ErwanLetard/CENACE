@@ -1,12 +1,16 @@
 # app.py
+import json
 import os
 import re
+import sys
 import math
 import gzip
 import hashlib
-from io import BytesIO, TextIOWrapper
+from io import BytesIO
+from pathlib import Path
 from datetime import date
 from urllib.parse import quote
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import pandas as pd
@@ -14,6 +18,11 @@ import numpy as np
 import streamlit as st
 import altair as alt
 import streamlit.components.v1 as components
+
+if sys.version_info < (3, 11):
+    raise RuntimeError(
+        "Python 3.11 ou supérieur est requis. Active un environnement construit avec `python3.11 -m venv`."
+    )
 
 _VOLTAGE_SUFFIX_RE = re.compile(r"-([0-9]+(?:\.[0-9]+)?)$")
 
@@ -63,6 +72,7 @@ with st.sidebar:
 GITHUB_REPO = "ErwanLetard/CENACE"              # <<— adapte si besoin
 SYSTEMS_ALL = ["SIN", "BCA", "BCS"]             # on cherche toujours les 3 systèmes
 ASSET_SUFFIX = ".csv.gz"                        # assets stockés en CSV.gz par mois/système
+CSV_ENCODING = "latin1"
 
 # NodosP dans le repo (chemin + ref)
 NODOSP_PATH_IN_REPO = "NodosP.xlsx"
@@ -98,7 +108,7 @@ def _fmt(val):
 # =====================================================================================
 # 🔐 GitHub API helpers (sans planter si pas de secrets.toml)
 # =====================================================================================
-def _get_github_token() -> str | None:
+def _get_github_token() -> Optional[str]:
     token = os.environ.get("GITHUB_TOKEN")
     try:
         if token is None and hasattr(st, "secrets"):
@@ -107,56 +117,66 @@ def _get_github_token() -> str | None:
         pass
     return token
 
+MANIFEST_PATH = "data_manifest.json"
+USER_AGENT = "CENACE-Spread-App"
+HEADER_REGEX = re.compile(r"^fecha", re.IGNORECASE)
+
+
 @st.cache_data(show_spinner=False)
-def list_release_assets(owner_repo: str, tag: str) -> list[dict]:
+def load_manifest(owner_repo: str, manifest_path: str = MANIFEST_PATH) -> Dict[str, Dict[str, str]]:
     """
-    Retourne la liste des assets pour un tag donné via l'API GitHub.
-    [{name, url}, ...] (url = browser_download_url)
+    Charge le manifest statique (mois -> {system: tag}) hébergé sur GitHub.
+    Fallback : essaie un fichier local si disponible.
     """
-    token = _get_github_token()
-    url = f"https://api.github.com/repos/{owner_repo}/releases/tags/{tag}"
-    headers = {"Accept": "application/vnd.github+json"}
+    url = f"https://raw.githubusercontent.com/{owner_repo}/main/{manifest_path}"
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as remote_exc:
+        local_path = Path(manifest_path)
+        if local_path.exists():
+            try:
+                with local_path.open("r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception as local_exc:
+                raise RuntimeError(
+                    f"Lecture du manifest échouée (GitHub: {remote_exc}, local: {local_exc})"
+                ) from local_exc
+        raise RuntimeError(f"Lecture du manifest échouée: {remote_exc}") from remote_exc
+
+
+def detect_header_offset(lines: List[str]) -> int:
+    for idx, line in enumerate(lines):
+        if HEADER_REGEX.match(line.strip()):
+            return idx
+    return 0
+
+
+@st.cache_data(show_spinner=False)
+def download_release_csv(owner_repo: str, tag: str, system: str, token: Optional[str]) -> bytes:
+    filename = f"{tag[1:]}_{system}{ASSET_SUFFIX}"
+    url = f"https://github.com/{owner_repo}/releases/download/{tag}/{filename}"
+    headers = {"User-Agent": USER_AGENT}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-    except requests.RequestException as exc:
-        st.error(f"GitHub request failed for tag {tag}: {exc}")
-        return []
-    if r.status_code == 404:
-        return []
-    if r.status_code == 403:
-        remaining = r.headers.get("X-RateLimit-Remaining")
-        if remaining == "0":
-            reset_ts = r.headers.get("X-RateLimit-Reset")
-            if reset_ts:
-                try:
-                    reset_dt = pd.to_datetime(int(reset_ts), unit="s").tz_localize("UTC").tz_convert("America/Mexico_City")
-                    reset_msg = reset_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-                except Exception:
-                    reset_msg = reset_ts
-                st.error(
-                    "GitHub API rate limit exceeded. Set `GITHUB_TOKEN` in Streamlit secrets "
-                    f"or retry after {reset_msg}."
-                )
-            else:
-                st.error("GitHub API rate limit exceeded. Add `GITHUB_TOKEN` or retry later.")
-        else:
-            st.error(f"GitHub API returned 403 for release {tag}. Check credentials.")
-        return []
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as exc:
-        st.error(f"GitHub call failed for release {tag}: {exc}")
-        return []
-    data = r.json()
-    out = []
-    for a in data.get("assets", []) or []:
-        name = a.get("name")
-        dl = a.get("browser_download_url")
-        if name and dl:
-            out.append({"name": name, "url": dl})
-    return out
+        headers["Authorization"] = f"token {token}"
+    response = requests.get(url, headers=headers, timeout=60)
+    if response.status_code == 404:
+        raise FileNotFoundError(url)
+    response.raise_for_status()
+    return response.content
+
+
+def parse_release_bytes(raw_bytes: bytes) -> pd.DataFrame:
+    with gzip.GzipFile(fileobj=BytesIO(raw_bytes), mode="rb") as gz:
+        decoded = gz.read().decode(CSV_ENCODING, errors="ignore")
+
+    lines = decoded.splitlines()
+    skip = detect_header_offset(lines)
+    payload = "\n".join(lines[skip:])
+    df = pd.read_csv(BytesIO(payload.encode("utf-8")), engine="python")
+    return _standardize_prices_df(df)
 
 # =====================================================================================
 # 💱 Devises (MXN↔USD)
@@ -181,19 +201,6 @@ def get_usd_mxn_rate() -> float:
 # =====================================================================================
 # 📥 Téléchargement données depuis GitHub (releases + raw)
 # =====================================================================================
-def month_tags_from_period(start_date: date, end_date: date):
-    """Liste 'vYYYY-MM' pour chaque mois couvert par [start_date, end_date] (borne à 2025-01..2025-09)."""
-    s = date(2025, 1, 1) if start_date < date(2025,1,1) else start_date
-    e = date(2025, 9, 30) if end_date > date(2025,9,30) else end_date
-    tags = []
-    y, m = s.year, s.month
-    while (y < e.year) or (y == e.year and m <= e.month):
-        tags.append(f"v{y}-{m:02d}")
-        m += 1
-        if m == 13:
-            m = 1
-            y += 1
-    return tags
 
 def _standardize_prices_df(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -242,61 +249,73 @@ def _standardize_prices_df(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["fecha", "hora", "nodo", "pml"])
 
 @st.cache_data(show_spinner=False)
-def fetch_prices_for_month_system(owner_repo: str, tag: str, system_code: str) -> pd.DataFrame:
-    """
-    Récupère le CSV.gz pour (tag, system) via l'API GitHub Releases.
-    On cherche un asset qui commence par '{YYYY}-{MM}_{SYS}' et finit par '.csv.gz'.
-    """
-    assert system_code in SYSTEMS_ALL
-    assets = list_release_assets(owner_repo, tag)
-    if not assets:
-        return pd.DataFrame(columns=["fecha","hora","nodo","pml"])
-
-    y, m = tag[1:].split("-")
-    prefix = f"{y}-{m}_{system_code}".lower()
-
-    match = None
-    for a in assets:
-        name = (a.get("name") or "").lower()
-        if name.startswith(prefix) and name.endswith(ASSET_SUFFIX):
-            match = a
-            break
-
-    if not match:
-        return pd.DataFrame(columns=["fecha","hora","nodo","pml"])
-
-    url = match["url"]
+def fetch_prices_for_release(owner_repo: str, tag: str, system_code: str, token: Optional[str]) -> pd.DataFrame:
     try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        with gzip.GzipFile(fileobj=BytesIO(r.content), mode="rb") as gz:
-            df = pd.read_csv(TextIOWrapper(gz, encoding="utf-8"))
-        return _standardize_prices_df(df)
-    except Exception:
-        return pd.DataFrame(columns=["fecha","hora","nodo","pml"])
+        raw_bytes = download_release_csv(owner_repo, tag, system_code, token)
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["fecha", "hora", "nodo", "pml"])
+    except Exception as exc:
+        st.warning(f"Téléchargement échoué pour {tag} · {system_code}: {exc}")
+        return pd.DataFrame(columns=["fecha", "hora", "nodo", "pml"])
+
+    try:
+        df = parse_release_bytes(raw_bytes)
+        return df
+    except Exception as exc:
+        st.warning(f"Parsing échoué pour {tag} · {system_code}: {exc}")
+        return pd.DataFrame(columns=["fecha", "hora", "nodo", "pml"])
+
+
+def month_keys_from_period(start_date: date, end_date: date) -> List[str]:
+    start_month = date(start_date.year, start_date.month, 1)
+    end_month = date(end_date.year, end_date.month, 1)
+    keys: List[str] = []
+    current = start_month
+    while current <= end_month:
+        keys.append(current.strftime("%Y-%m"))
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+    return keys
+
 
 @st.cache_data(show_spinner=False)
-def load_all_prices(start_date: date, end_date: date) -> pd.DataFrame:
-    """
-    Combine tous les CSV.gz (SIN/BCA/BCS) pour tous les mois utiles.
-    Retour: DataFrame unique trié (nodo, fecha, hora) + 'nivel_tension'.
-    """
-    tags = month_tags_from_period(start_date, end_date)
-    dfs = []
-    for tag in tags:
-        for sys in SYSTEMS_ALL:
-            df = fetch_prices_for_month_system(GITHUB_REPO, tag, sys)
-            if not df.empty:
-                dfs.append(df)
-    if not dfs:
-        return pd.DataFrame(columns=["fecha","hora","nodo","pml","nivel_tension"])
-    df_all = pd.concat(dfs, ignore_index=True)
+def load_all_prices(
+    start_date: date,
+    end_date: date,
+    manifest: Dict[str, Dict[str, str]],
+    repo: str,
+    token: Optional[str],
+) -> pd.DataFrame:
+    month_keys = month_keys_from_period(start_date, end_date)
+    frames: List[pd.DataFrame] = []
+
+    for month_key in month_keys:
+        systems_map = manifest.get(month_key, {})
+        if not systems_map:
+            continue
+        for system in SYSTEMS_ALL:
+            tag = systems_map.get(system)
+            if not tag:
+                continue
+            df = fetch_prices_for_release(repo, tag, system, token)
+            if df.empty:
+                continue
+            df["source_tag"] = tag
+            df["source_system"] = system
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=["fecha", "hora", "nodo", "pml", "nivel_tension", "source_tag", "source_system"])
+
+    df_all = pd.concat(frames, ignore_index=True)
     nodo_series = df_all["nodo"].astype(str).str.strip()
     df_all["nodo"] = nodo_series
     df_all["nivel_tension"] = nodo_series.str.extract(_VOLTAGE_SUFFIX_RE, expand=False)
-    start_ts = pd.to_datetime(start_date)
-    end_ts = pd.to_datetime(end_date)
-    mask = (df_all["fecha"] >= start_ts) & (df_all["fecha"] <= end_ts)
+    df_all["fecha"] = pd.to_datetime(df_all["fecha"]).dt.date
+    df_all["hora"] = df_all["hora"].astype(int)
+    mask = (df_all["fecha"] >= start_date) & (df_all["fecha"] <= end_date)
     df_all = df_all.loc[mask]
     try:
         df_all["nodo"] = df_all["nodo"].astype("category")
@@ -305,7 +324,7 @@ def load_all_prices(start_date: date, end_date: date) -> pd.DataFrame:
         df_all["pml"] = df_all["pml"].astype("float32")
     except Exception:
         pass
-    return df_all.sort_values(["nodo","fecha","hora"], ignore_index=True)
+    return df_all.sort_values(["nodo", "fecha", "hora"], ignore_index=True)
 
 @st.cache_data(show_spinner=False)
 def read_nodosp_excel_from_repo(repo=GITHUB_REPO, ref=NODOSP_REPO_REF, path=NODOSP_PATH_IN_REPO) -> pd.DataFrame:
@@ -366,17 +385,19 @@ def lttb_downsample(x, y, threshold: int):
 
 def build_price_series_hourly(df_all: pd.DataFrame, nodo: str, start_date, end_date) -> pd.DataFrame:
     """Extrait la série horaire PML pour un nœud sur une plage de dates."""
+    fechas_full = pd.to_datetime(df_all["fecha"])
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
     mask = (
         (df_all["nodo"] == nodo) &
-        (df_all["fecha"] >= start_ts) &
-        (df_all["fecha"] <= end_ts)
+        (fechas_full >= start_ts) &
+        (fechas_full <= end_ts)
     )
     sub = df_all.loc[mask, ["fecha", "hora", "pml"]].dropna().copy()
     if sub.empty:
         return pd.DataFrame(columns=["ts", "pml"])
     hora0 = sub["hora"].astype(int) - 1  # 1..24 -> 0..23
+    sub["fecha"] = fechas_full[mask].dt.normalize()
     sub["ts"] = sub["fecha"] + pd.to_timedelta(hora0, unit="h")
     return sub.sort_values("ts", ignore_index=True)[["ts", "pml"]]
 
@@ -525,10 +546,12 @@ def compute_avg_spread_from_daily(daily_spread: pd.DataFrame, start_date, end_da
     """Retourne la moyenne des spreads journaliers max–min sur la période donnée."""
     if daily_spread.empty:
         return pd.DataFrame(columns=["nodo", "avg_spread", "n_days_used"])
+    fechas = pd.to_datetime(daily_spread["fecha"])
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
-    mask = (daily_spread["fecha"] >= start_ts) & (daily_spread["fecha"] <= end_ts)
-    subset = daily_spread.loc[mask]
+    mask = (fechas >= start_ts) & (fechas <= end_ts)
+    subset = daily_spread.loc[mask].copy()
+    subset["fecha"] = fechas[mask]
     result = (
         subset.groupby("nodo", observed=True)["spread"]
               .agg(avg_spread="mean", n_days_used="count")
@@ -542,10 +565,12 @@ def compute_avg_window_spread(daily_win: pd.DataFrame, start_date, end_date) -> 
     """Retourne la moyenne des spreads rolling-window sur la période donnée."""
     if daily_win.empty:
         return pd.DataFrame(columns=["nodo", "avg_spread_win", "n_days_used"])
+    fechas = pd.to_datetime(daily_win["fecha"])
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
-    mask = (daily_win["fecha"] >= start_ts) & (daily_win["fecha"] <= end_ts)
-    subset = daily_win.loc[mask]
+    mask = (fechas >= start_ts) & (fechas <= end_ts)
+    subset = daily_win.loc[mask].copy()
+    subset["fecha"] = fechas[mask]
     res = (
         subset.groupby("nodo", observed=True)["spread_win"]
               .agg(avg_spread_win="mean", n_days_used="count")
@@ -564,7 +589,7 @@ VDM_RULES = {
 }
 
 @st.cache_data(show_spinner=False, ttl=None)
-def geocode_city_cached(city_norm: str) -> tuple[float | None, float | None]:
+def geocode_city_cached(city_norm: str) -> Tuple[Optional[float], Optional[float]]:
     """Renvoie (lat, lon) pour une ville normalisée, avec cache illimité."""
     if not city_norm:
         return (None, None)
@@ -581,7 +606,7 @@ def geocode_city_cached(city_norm: str) -> tuple[float | None, float | None]:
     return (loc.latitude, loc.longitude)
 
 @st.cache_data(show_spinner=False, ttl=None)
-def build_city_coords_cached(unique_cities: tuple[str, ...],
+def build_city_coords_cached(unique_cities: Tuple[str, ...],
                              allow_online_geocoding: bool) -> pd.DataFrame:
     """
     Construit un DataFrame (city_norm, lat, lon) pour une liste triée de villes.
@@ -625,6 +650,8 @@ def jitter_positions(group_df: pd.DataFrame, radius_m: float = 400.0) -> np.ndar
 # =====================================================================================
 # 🎛️ Panneau latéral — paramètres utilisateur + bouton Load
 # =====================================================================================
+previous_cfg = st.session_state.get("cfg", {})
+
 with st.sidebar.form("settings_form"):
     st.header("⚙️ Période & Filtres")
     min_allowed = date(2025,1,1)
@@ -663,6 +690,13 @@ with st.sidebar.form("settings_form"):
     map_subset_mode = st.radio("Nodes to show on the map", ["All filtered nodes","Top N by avg spread"], index=0)
     map_top_n = st.number_input("N for map (if Top N)", min_value=5, max_value=1000, value=200, step=5)
 
+    github_token_manual = st.text_input(
+        "GitHub token (optionnel)",
+        value=previous_cfg.get("github_token_manual", ""),
+        type="password",
+        help="Facultatif. Renseigne un token personnel pour de meilleurs débits de téléchargement.",
+    )
+
     # Carte
     allow_online_geocoding = st.checkbox("Allow online geocoding (Nominatim)", value=True)
 
@@ -684,6 +718,7 @@ if load_clicked or "cfg" not in st.session_state:
         "map_top_n": int(map_top_n),
         "allow_online_geocoding": bool(allow_online_geocoding),
         "load_clicked": bool(load_clicked),
+        "github_token_manual": github_token_manual.strip(),
     }
 cfg = st.session_state["cfg"]
 
@@ -695,10 +730,22 @@ if not cfg.get("load_clicked", False):
 # =====================================================================================
 # 📦 Chargement des données (GitHub)
 # =====================================================================================
-data_sig = (cfg["start_date"], cfg["end_date"])
+try:
+    manifest = load_manifest(GITHUB_REPO)
+except RuntimeError as exc:
+    st.error(f"Manifest introuvable: {exc}")
+    st.stop()
+
+download_token = cfg.get("github_token_manual", "").strip() or (_get_github_token() or None)
+
+data_sig = (cfg["start_date"], cfg["end_date"], GITHUB_REPO, download_token)
 if st.session_state.get("_data_sig") != data_sig or "_df_all" not in st.session_state:
-    with st.spinner("Téléchargement & assemblage des données (GitHub Releases)…"):
-        df_all = load_all_prices(cfg["start_date"], cfg["end_date"])
+    with st.spinner("Téléchargement & assemblage des données (releases GitHub)…"):
+        try:
+            df_all = load_all_prices(cfg["start_date"], cfg["end_date"], manifest, GITHUB_REPO, download_token)
+        except Exception as exc:
+            st.error(f"Téléchargement échoué: {exc}")
+            st.stop()
     st.session_state["_data_sig"] = data_sig
     st.session_state["_df_all"] = df_all
 else:
@@ -819,12 +866,14 @@ with st.expander("🔎 Per-node daily spreads (max–min)"):
     if node_sel:
         start_ts = pd.to_datetime(cfg["start_date"])
         end_ts = pd.to_datetime(cfg["end_date"])
+        fechas_full = pd.to_datetime(daily_all_mxn["fecha"])
         mask = (
             (daily_all_mxn["nodo"] == node_sel) &
-            (daily_all_mxn["fecha"] >= start_ts) &
-            (daily_all_mxn["fecha"] <= end_ts)
+            (fechas_full >= start_ts) &
+            (fechas_full <= end_ts)
         )
         node_daily = daily_all_mxn.loc[mask].sort_values("fecha").copy()
+        node_daily["fecha"] = fechas_full[mask].dt.date
         node_daily["spread_disp"] = node_daily["spread"] * conv_factor
         st.dataframe(
             node_daily[["fecha", "spread_disp", "n_hours"]]
