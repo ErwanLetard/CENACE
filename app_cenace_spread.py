@@ -672,7 +672,7 @@ with st.sidebar.form("settings_form"):
     if currency == "USD":
         st.caption(f"Taux USD→MXN utilisé: {rate_usd_mxn:.4f} (PML_USD = PML_MXN / taux)")
 
-    min_hours = st.slider("Minimum hours per day (data quality)", 1, 24, 18)
+    min_hours = st.slider("Minimum hours per day (data quality)", 1, 24, 24)
 
     # Rolling-window ou Daily max–min
     metric_mode = st.radio(
@@ -688,7 +688,7 @@ with st.sidebar.form("settings_form"):
     # Limites carte
     top_n = st.number_input("Show Top N nodes (table/chart)", min_value=5, max_value=200, value=50, step=5)
     map_subset_mode = st.radio("Nodes to show on the map", ["All filtered nodes","Top N by avg spread"], index=0)
-    map_top_n = st.number_input("N for map (if Top N)", min_value=5, max_value=1000, value=200, step=5)
+    map_top_n = st.number_input("N for map (if Top N)", min_value=5, max_value=1000, value=50, step=5)
 
     github_token_manual = st.text_input(
         "GitHub token (optionnel)",
