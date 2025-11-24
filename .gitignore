@@ -1,0 +1,7 @@
+.venv/
+.env
+
+app_cenace_spread.py
+data_manifest.json
+local_app.py
+NodosP.xlsx
